@@ -1,2 +1,1 @@
 requests>=2.25
-elasticsearch>=8.0

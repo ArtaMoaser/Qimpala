@@ -19,8 +19,8 @@ Flow:
                     -> rule engine
                         -> bulk index into Elasticsearch
 
-Dependencies: requests, elasticsearch (official python client).
-No databases, no Kafka, no Redis.
+Dependencies: requests only (Elasticsearch is reached through its REST API,
+compatible with Elasticsearch 7.x). No databases, no Kafka, no Redis.
 """
 
 import json
@@ -32,12 +32,6 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
-
-try:
-    from elasticsearch import Elasticsearch, helpers
-    ES_AVAILABLE = True
-except ImportError:
-    ES_AVAILABLE = False
 
 # ==================================================
 # CONFIG
@@ -57,9 +51,11 @@ REQUEST_TIMEOUT = 5                    # /queries?json timeout
 PROFILE_TIMEOUT = 15                   # /query_profile timeout (profiles can be large)
 PROFILE_WORKERS = 4                    # parallel profile fetches per server
 
-ELASTICSEARCH_HOSTS = ["http://elasticsearch01.company.local:9200"]
-ELASTICSEARCH_USER = None              # set to ("user", "pass") tuple via basic_auth if needed
+ELASTICSEARCH_URL = "http://elasticsearch01.company.local:9200"
+ELASTICSEARCH_USER = None              # set both for HTTP basic auth
 ELASTICSEARCH_PASSWORD = None
+ELASTICSEARCH_TIMEOUT = 10             # seconds per REST call
+ELASTICSEARCH_VERIFY_TLS = True        # set False for self-signed https
 
 INDEX_SUMMARY = "impala-query-summary"
 INDEX_METRICS = "impala-query-metrics"
@@ -820,51 +816,88 @@ INDEX_DEFINITIONS = {
 
 
 class ElasticsearchSink:
-    """Thin wrapper around the official client: ensures indices exist and
-    bulk-indexes documents. Falls back to the local audit log when ES is
-    unreachable so no data is silently dropped."""
+    """Talks to Elasticsearch 7.x through its plain REST API using requests -
+    no python client dependency. Ensures the three indices exist on startup
+    and indexes documents one-by-one (PUT /<index>/_doc/<id>) or in batches
+    (POST /_bulk). Falls back to the local audit log when ES is unreachable
+    so no data is silently dropped."""
 
     def __init__(self):
-        self.es = None
-        if not ES_AVAILABLE:
-            log.warning("elasticsearch package not installed - documents go to %s only", OUTPUT_LOG)
-            return
-        kwargs = {}
+        self.base_url = ELASTICSEARCH_URL.rstrip("/")
+        self.session = requests.Session()
+        self.session.headers["Content-Type"] = "application/json"
         if ELASTICSEARCH_USER:
-            kwargs["basic_auth"] = (ELASTICSEARCH_USER, ELASTICSEARCH_PASSWORD)
+            self.session.auth = (ELASTICSEARCH_USER, ELASTICSEARCH_PASSWORD)
+        self.session.verify = ELASTICSEARCH_VERIFY_TLS
+        self.available = False
         try:
-            self.es = Elasticsearch(ELASTICSEARCH_HOSTS, request_timeout=10, **kwargs)
+            r = self.session.get(self.base_url, timeout=ELASTICSEARCH_TIMEOUT)
+            r.raise_for_status()
+            version = r.json().get("version", {}).get("number", "?")
+            log.info("connected to Elasticsearch %s at %s", version, self.base_url)
+            self.available = True
             self.create_indices()
         except Exception as e:
-            log.error("Elasticsearch unavailable: %s", e)
-            self.es = None
+            log.error("Elasticsearch unavailable at %s: %s", self.base_url, e)
+
+    def _request(self, method, path, body=None, ndjson=None):
+        """One REST call; returns the parsed JSON response or None on error."""
+        url = "%s/%s" % (self.base_url, path.lstrip("/"))
+        kwargs = {"timeout": ELASTICSEARCH_TIMEOUT}
+        if ndjson is not None:
+            kwargs["data"] = ndjson
+            kwargs["headers"] = {"Content-Type": "application/x-ndjson"}
+        elif body is not None:
+            kwargs["data"] = json.dumps(body, default=str)
+        r = self.session.request(method, url, **kwargs)
+        if r.status_code >= 300:
+            raise RuntimeError("ES %s %s -> %d: %s"
+                               % (method, path, r.status_code, r.text[:500]))
+        return r.json() if r.text else None
 
     def create_indices(self):
         for index, body in INDEX_DEFINITIONS.items():
             try:
-                if not self.es.indices.exists(index=index):
-                    self.es.indices.create(index=index, **body)
-                    log.info("created index %s", index)
+                # HEAD /<index> -> 200 if it exists, 404 otherwise
+                head = self.session.head("%s/%s" % (self.base_url, index),
+                                         timeout=ELASTICSEARCH_TIMEOUT)
+                if head.status_code == 200:
+                    continue
+                self._request("PUT", index, body=body)
+                log.info("created index %s", index)
             except Exception as e:
                 log.error("index creation failed for %s: %s", index, e)
 
     def index(self, index, doc):
-        """Index one document; doc id = query_id so re-processing upserts."""
+        """PUT /<index>/_doc/<query_id> - id = query_id so re-processing
+        the same query upserts instead of duplicating."""
         write_log({"_index": index, **doc})  # audit trail always
-        if not self.es:
+        if not self.available:
             return
         try:
-            self.es.index(index=index, id=doc.get("query_id"), document=doc)
+            doc_id = requests.utils.quote(str(doc.get("query_id")), safe="")
+            self._request("PUT", "%s/_doc/%s" % (index, doc_id), body=doc)
         except Exception as e:
             log.error("ES index %s failed for %s: %s", index, doc.get("query_id"), e)
 
     def bulk(self, actions):
-        if not self.es:
-            for a in actions:
-                write_log(a)
+        """POST /_bulk with NDJSON. actions = [(index, doc), ...]."""
+        if not self.available:
+            for _, doc in actions:
+                write_log(doc)
             return
+        lines = []
+        for index, doc in actions:
+            lines.append(json.dumps(
+                {"index": {"_index": index, "_id": doc.get("query_id")}}))
+            lines.append(json.dumps(doc, default=str))
         try:
-            helpers.bulk(self.es, actions, raise_on_error=False)
+            resp = self._request("POST", "_bulk", ndjson="\n".join(lines) + "\n")
+            if resp and resp.get("errors"):
+                failed = [i["index"] for i in resp.get("items", [])
+                          if i.get("index", {}).get("status", 200) >= 300]
+                log.error("ES bulk: %d item(s) failed, first: %s",
+                          len(failed), failed[0] if failed else "?")
         except Exception as e:
             log.error("ES bulk failed: %s", e)
 
