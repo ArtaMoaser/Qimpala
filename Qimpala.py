@@ -190,6 +190,26 @@ def parse_duration_ms(text):
     return total
 
 
+# Impala prints timestamps as '2026-06-08 19:08:15.456143000' (space
+# separator, up to 9 fractional digits, no timezone). The cluster runs with
+# TIMEZONE=Etc/UTC, so we treat these as UTC and emit ISO-8601 with
+# millisecond precision, which Elasticsearch 7 maps cleanly to `date`.
+_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.(\d+))?")
+
+
+def parse_impala_timestamp(text):
+    """'2026-06-08 19:08:15.456143000' -> '2026-06-08T19:08:15.456Z'.
+    Returns None when the string is empty or not a timestamp. Never raises."""
+    if not text:
+        return None
+    m = _TS_RE.match(str(text).strip())
+    if not m:
+        return None
+    date_part, time_part, frac = m.group(1), m.group(2), m.group(3) or ""
+    millis = (frac + "000")[:3]  # pad/truncate fractional seconds to ms
+    return "%sT%s.%sZ" % (date_part, time_part, millis)
+
+
 def parse_value(text):
     """Parse a single profile counter value into a number.
 
@@ -758,22 +778,34 @@ class QueryAnalyzer:
 
 # keep mappings lean: dynamic numeric metrics map fine automatically,
 # we only pin the fields we query/aggregate on.
+# All date fields accept both ISO-8601 strings and epoch millis so the
+# mapping never rejects a document.
+_DATE = {"type": "date", "format": "strict_date_optional_time||epoch_millis"}
+
 INDEX_DEFINITIONS = {
     INDEX_SUMMARY: {
         "mappings": {
             "properties": {
-                "@timestamp": {"type": "date"},
+                "@timestamp": _DATE,        # when the collector wrote the doc
+                "collected_at": _DATE,       # last time this query was scraped
+                "start_time": _DATE,         # query start (real event time)
+                "end_time": _DATE,           # query end
                 "query_id": {"type": "keyword"},
                 "host": {"type": "keyword"},
                 "user": {"type": "keyword"},
                 "connected_user": {"type": "keyword"},
+                "delegated_user": {"type": "keyword"},
                 "request_pool": {"type": "keyword"},
                 "query_state": {"type": "keyword"},
                 "impala_query_state": {"type": "keyword"},
+                "query_status": {"type": "keyword"},
                 "query_type": {"type": "keyword"},
+                "session_type": {"type": "keyword"},
                 "coordinator": {"type": "keyword"},
                 "default_db": {"type": "keyword"},
+                "network_address": {"type": "keyword"},
                 "duration_ms": {"type": "double"},
+                "query_compilation_total_ms": {"type": "double"},
                 "query_text": {"type": "text"},
                 "query_timeline": {"type": "object", "enabled": True},
                 "query_compilation": {"type": "object", "enabled": True},
@@ -790,7 +822,9 @@ INDEX_DEFINITIONS = {
                 }}
             ],
             "properties": {
-                "@timestamp": {"type": "date"},
+                "@timestamp": _DATE,
+                "collected_at": _DATE,
+                "start_time": _DATE,
                 "query_id": {"type": "keyword"},
                 "host": {"type": "keyword"},
             },
@@ -799,7 +833,9 @@ INDEX_DEFINITIONS = {
     INDEX_ANALYSIS: {
         "mappings": {
             "properties": {
-                "@timestamp": {"type": "date"},
+                "@timestamp": _DATE,
+                "collected_at": _DATE,
+                "start_time": _DATE,
                 "query_id": {"type": "keyword"},
                 "host": {"type": "keyword"},
                 "suspected_root_cause": {"type": "keyword"},
@@ -809,6 +845,7 @@ INDEX_DEFINITIONS = {
                 "duration_ms": {"type": "double"},
                 "user": {"type": "keyword"},
                 "request_pool": {"type": "keyword"},
+                "query_state": {"type": "keyword"},
             }
         }
     },
@@ -970,7 +1007,14 @@ def compute_duration_ms(summary, timeline, profile_parser):
 
 def build_documents(server, query_id, query_text, profile_text):
     """Parse one profile and return the three documents (summary, metrics,
-    analysis). Never raises - parse failures yield partially-filled docs."""
+    analysis). Never raises - parse failures yield partially-filled docs.
+
+    Date handling: the query's real Start Time becomes the primary event
+    time (`@timestamp`) so dashboards bucket queries by when they actually
+    ran, not by when the collector happened to scrape them. `collected_at`
+    records the scrape time separately. All three docs share `_id=query_id`
+    (set by the sink), so a long-running query scraped on several cycles
+    collapses to exactly one document - counting docs == counting queries."""
     now = datetime.now(timezone.utc).isoformat()
     parser = ProfileParser(profile_text)
 
@@ -980,15 +1024,24 @@ def build_documents(server, query_id, query_text, profile_text):
     exec_summary = parser.extract_exec_summary()
     duration_ms = compute_duration_ms(summary, timeline, parser)
 
+    start_time = parse_impala_timestamp(summary.get("start_time"))
+    end_time = parse_impala_timestamp(summary.get("end_time"))
+
     base = {
-        "@timestamp": now,
+        # event time = real query start when known, else scrape time
+        "@timestamp": start_time or now,
+        "collected_at": now,
+        "start_time": start_time,
         "query_id": query_id,
         "host": server,
     }
 
+    summary_fields = {k: v for k, v in summary.items()
+                      if k not in ("sql_statement", "start_time", "end_time")}
     summary_doc = {
         **base,
-        **{k: v for k, v in summary.items() if k != "sql_statement"},
+        **summary_fields,
+        "end_time": end_time,
         "query_text": query_text or summary.get("sql_statement"),
         "duration_ms": duration_ms,
         "query_compilation": compilation["events"],
@@ -1112,12 +1165,13 @@ if __name__ == "__main__":
 # impala-query-summary
 # --------------------
 # {
-#   "@timestamp": "2026-06-08T19:08:20.123456+00:00",
+#   "@timestamp": "2026-06-08T19:08:15.456Z",   <- real query start (event time)
+#   "collected_at": "2026-06-08T19:08:20.123456+00:00",  <- when scraped
 #   "query_id": "304a6c7ec2b1380e:6bfd4df200000000",
 #   "host": "impala01.company.local",
 #   "session_id": "0f430fd720fcbf88:ed78c5a2777ad78b",
 #   "session_type": "HIVESERVER2",
-#   "start_time": "2026-06-08 19:08:15.456143000",
+#   "start_time": "2026-06-08T19:08:15.456Z",    <- ISO-8601, mapped as date
 #   "end_time": null,
 #   "query_type": "QUERY",
 #   "query_state": "FINISHED",
