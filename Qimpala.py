@@ -47,6 +47,28 @@ IMPALA_SERVERS = [
 
 IMPALA_WEBUI_PORT = 25000
 
+# --- HDFS NameNodes (JMX) ---------------------------------------------
+# Two NameNodes in an HA pair; both are polled and each doc records whether
+# it was the active or standby node at scrape time.
+HDFS_NAMENODES = [
+    "namenode01.company.local",
+    "namenode02.company.local",
+]
+HDFS_JMX_PORT = 50070                  # http://<nn>:50070/jmx
+
+# --- Kudu masters (JSON metrics) --------------------------------------
+KUDU_MASTERS = [
+    "kudumaster01.company.local",
+    "kudumaster02.company.local",
+    "kudumaster03.company.local",
+]
+KUDU_METRICS_PORT = 8051               # http://<master>:8051/metrics
+
+# Cluster-health endpoints are cheap and change slowly, so poll them less
+# often than queries. These are time-series snapshots (one doc per node per
+# poll), unlike query docs which upsert by query_id.
+CLUSTER_POLL_INTERVAL = 30             # seconds between HDFS/Kudu scrapes
+
 REQUEST_TIMEOUT = 5                    # /queries?json timeout
 PROFILE_TIMEOUT = 15                   # /query_profile timeout (profiles can be large)
 PROFILE_WORKERS = 4                    # parallel profile fetches per server
@@ -60,6 +82,8 @@ ELASTICSEARCH_VERIFY_TLS = True        # set False for self-signed https
 INDEX_SUMMARY = "impala-query-summary"
 INDEX_METRICS = "impala-query-metrics"
 INDEX_ANALYSIS = "impala-query-analysis"
+INDEX_HDFS = "hdfs-namenode-metrics"   # time-series cluster health
+INDEX_KUDU = "kudu-master-metrics"     # time-series cluster health
 
 OUTPUT_LOG = "impala_queries.json"     # fallback / audit trail (newline-delimited JSON)
 
@@ -849,6 +873,100 @@ INDEX_DEFINITIONS = {
             }
         }
     },
+    # --- HDFS NameNode health (time series) ---------------------------
+    INDEX_HDFS: {
+        "mappings": {
+            "dynamic_templates": [
+                {"jmx_longs_as_double": {
+                    "path_match": "jmx.*",
+                    "match_mapping_type": "long",
+                    "mapping": {"type": "double"}}},
+            ],
+            "properties": {
+                "@timestamp": _DATE,
+                "host": {"type": "keyword"},
+                "ha_state": {"type": "keyword"},      # active / standby
+                "fs_state": {"type": "keyword"},
+                "safemode": {"type": "keyword"},
+                # capacity
+                "capacity_total_bytes": {"type": "double"},
+                "capacity_used_bytes": {"type": "double"},
+                "capacity_remaining_bytes": {"type": "double"},
+                "capacity_used_pct": {"type": "double"},
+                "total_load": {"type": "double"},
+                # blocks / files
+                "blocks_total": {"type": "double"},
+                "files_total": {"type": "double"},
+                "missing_blocks": {"type": "double"},
+                "corrupt_blocks": {"type": "double"},
+                "under_replicated_blocks": {"type": "double"},
+                "pending_replication_blocks": {"type": "double"},
+                "pending_deletion_blocks": {"type": "double"},
+                "excess_blocks": {"type": "double"},
+                # datanodes
+                "num_live_datanodes": {"type": "integer"},
+                "num_dead_datanodes": {"type": "integer"},
+                "num_stale_datanodes": {"type": "integer"},
+                "num_decom_live_datanodes": {"type": "integer"},
+                "num_decom_dead_datanodes": {"type": "integer"},
+                "volume_failures_total": {"type": "integer"},
+                # rpc
+                "rpc_queue_time_avg_ms": {"type": "double"},
+                "rpc_processing_time_avg_ms": {"type": "double"},
+                "rpc_queue_time_num_ops": {"type": "double"},
+                "rpc_processing_time_num_ops": {"type": "double"},
+                "call_queue_length": {"type": "double"},
+                "num_open_connections": {"type": "double"},
+                # jvm
+                "jvm_heap_used_mb": {"type": "double"},
+                "jvm_heap_max_mb": {"type": "double"},
+                "jvm_heap_used_pct": {"type": "double"},
+                "jvm_gc_count": {"type": "double"},
+                "jvm_gc_time_ms": {"type": "double"},
+                "jvm_gc_num_warn_threshold_exceeded": {"type": "double"},
+                "threads_blocked": {"type": "double"},
+                "threads_waiting": {"type": "double"},
+            },
+        }
+    },
+    # --- Kudu master health (time series) ----------------------------
+    INDEX_KUDU: {
+        "mappings": {
+            "dynamic_templates": [
+                {"metrics_longs_as_double": {
+                    "path_match": "metrics.*",
+                    "match_mapping_type": "long",
+                    "mapping": {"type": "double"}}},
+            ],
+            "properties": {
+                "@timestamp": _DATE,
+                "host": {"type": "keyword"},
+                "entity_id": {"type": "keyword"},     # e.g. kudu.master
+                "is_leader": {"type": "boolean"},
+                # promoted, well-known server metrics
+                "rpc_queue_overflow": {"type": "double"},
+                "rpc_incoming_queue_time_mean_us": {"type": "double"},
+                "rpc_incoming_queue_time_p99_us": {"type": "double"},
+                "rpc_incoming_queue_time_max_us": {"type": "double"},
+                "rpc_incoming_queue_time_count": {"type": "double"},
+                "rpc_connections_accepted": {"type": "double"},
+                "threads_running": {"type": "double"},
+                "threads_started": {"type": "double"},
+                "cpu_utime_ms": {"type": "double"},
+                "cpu_stime_ms": {"type": "double"},
+                "voluntary_context_switches": {"type": "double"},
+                "involuntary_context_switches": {"type": "double"},
+                "glog_error_messages": {"type": "double"},
+                "glog_warning_messages": {"type": "double"},
+                "block_cache_hits_caching": {"type": "double"},
+                "block_cache_misses_caching": {"type": "double"},
+                "block_cache_usage_bytes": {"type": "double"},
+                "block_cache_hit_ratio": {"type": "double"},
+                "data_dirs_failed": {"type": "double"},
+                "data_dirs_full": {"type": "double"},
+            },
+        }
+    },
 }
 
 
@@ -905,17 +1023,26 @@ class ElasticsearchSink:
             except Exception as e:
                 log.error("index creation failed for %s: %s", index, e)
 
-    def index(self, index, doc):
-        """PUT /<index>/_doc/<query_id> - id = query_id so re-processing
-        the same query upserts instead of duplicating."""
+    def index(self, index, doc, doc_id=None):
+        """Index one document.
+
+        Query docs pass no doc_id and carry query_id -> PUT /_doc/<query_id>,
+        which upserts so a query is never duplicated. Cluster time-series docs
+        pass an explicit doc_id (e.g. '<host>_<epoch_ms>') so each snapshot is
+        a distinct, append-only document. If neither is given, ES auto-assigns
+        an id via POST /_doc."""
         write_log({"_index": index, **doc})  # audit trail always
         if not self.available:
             return
+        ref = doc_id or doc.get("query_id")
         try:
-            doc_id = requests.utils.quote(str(doc.get("query_id")), safe="")
-            self._request("PUT", "%s/_doc/%s" % (index, doc_id), body=doc)
+            if ref is not None:
+                self._request("PUT", "%s/_doc/%s" % (
+                    index, requests.utils.quote(str(ref), safe="")), body=doc)
+            else:
+                self._request("POST", "%s/_doc" % index, body=doc)
         except Exception as e:
-            log.error("ES index %s failed for %s: %s", index, doc.get("query_id"), e)
+            log.error("ES index %s failed for %s: %s", index, ref, e)
 
     def bulk(self, actions):
         """POST /_bulk with NDJSON. actions = [(index, doc), ...]."""
@@ -983,6 +1110,33 @@ def extract_queries(payload):
     for key in ("in_flight_queries", "completed_queries", "queries", "active_queries"):
         queries.extend(payload.get(key) or [])
     return queries
+
+
+def fetch_jmx(host):
+    """Fetch the HDFS NameNode JMX page (JSON: {'beans': [...]}).
+    Returns the list of beans or None on error."""
+    url = "http://%s:%d/jmx" % (host, HDFS_JMX_PORT)
+    try:
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        return response.json().get("beans", [])
+    except Exception as e:
+        log.warning("HDFS %s -> jmx fetch failed: %s", host, e)
+        return None
+
+
+def fetch_kudu_metrics(host):
+    """Fetch the Kudu master metrics page (JSON: list of entities).
+    Returns the list of entities or None on error."""
+    url = "http://%s:%d/metrics" % (host, KUDU_METRICS_PORT)
+    try:
+        # compact=1 trims whitespace; schema is omitted by default
+        response = requests.get(url, params={"compact": "1"}, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        log.warning("Kudu %s -> metrics fetch failed: %s", host, e)
+        return None
 
 
 # ==================================================
@@ -1067,6 +1221,202 @@ def build_documents(server, query_id, query_text, profile_text):
 
 
 # ==================================================
+# HDFS NAMENODE (JMX) BUILDER
+# ==================================================
+
+def _index_beans(beans):
+    """Index JMX beans by their short name. A bean name looks like
+    'Hadoop:service=NameNode,name=FSNamesystem'; we key on the 'name=' part."""
+    out = {}
+    for bean in beans or []:
+        full = bean.get("name", "")
+        m = re.search(r"name=([^,]+)", full)
+        if m:
+            out[m.group(1)] = bean
+    return out
+
+
+def _num(bean, key):
+    """Read a numeric field from a JMX bean, tolerating missing keys/types."""
+    if not bean:
+        return None
+    v = bean.get(key)
+    if isinstance(v, bool):
+        return None
+    return v if isinstance(v, (int, float)) else None
+
+
+def build_hdfs_doc(host, beans):
+    """Flatten the diagnostically useful HDFS NameNode JMX beans into one
+    time-series document. Missing fields become null; never raises.
+
+    Beans used (standard Hadoop NameNode JMX):
+      FSNamesystem / FSNamesystemState  -> capacity, blocks, datanode health
+      NameNodeStatus                    -> active / standby (HA role)
+      NameNodeInfo                      -> safemode, percent used
+      RpcActivityForPort*               -> RPC latency / call queue
+      JvmMetrics                        -> heap, GC, threads
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    by = _index_beans(beans)
+    fsn = by.get("FSNamesystem")
+    fss = by.get("FSNamesystemState")
+    nninfo = by.get("NameNodeInfo")
+    nnstatus = by.get("NameNodeStatus")
+    jvm = by.get("JvmMetrics")
+    # RPC bean name carries the port (RpcActivityForPort8020); pick the first.
+    rpc = next((b for n, b in by.items() if n.startswith("RpcActivityForPort")), None)
+
+    cap_total = _num(fsn, "CapacityTotal")
+    cap_used = _num(fsn, "CapacityUsed")
+    cap_remaining = _num(fsn, "CapacityRemaining")
+    heap_used = _num(jvm, "MemHeapUsedM")
+    heap_max = _num(jvm, "MemHeapMaxM")
+
+    doc = {
+        "@timestamp": now,
+        "host": host,
+        "ha_state": (_str(nnstatus, "State") or "").lower() or None,
+        "fs_state": _str(fss, "FSState"),
+        "safemode": _str(nninfo, "Safemode") or "OFF",
+        # capacity
+        "capacity_total_bytes": cap_total,
+        "capacity_used_bytes": cap_used,
+        "capacity_remaining_bytes": cap_remaining,
+        "capacity_used_pct": (100.0 * cap_used / cap_total)
+                              if (cap_total and cap_used is not None) else None,
+        "total_load": _num(fsn, "TotalLoad"),
+        # blocks / files
+        "blocks_total": _num(fsn, "BlocksTotal"),
+        "files_total": _num(fsn, "FilesTotal"),
+        "missing_blocks": _num(fsn, "MissingBlocks"),
+        "corrupt_blocks": _num(fsn, "CorruptBlocks"),
+        "under_replicated_blocks": _num(fsn, "UnderReplicatedBlocks"),
+        "pending_replication_blocks": _num(fsn, "PendingReplicationBlocks"),
+        "pending_deletion_blocks": _num(fsn, "PendingDeletionBlocks"),
+        "excess_blocks": _num(fsn, "ExcessBlocks"),
+        # datanodes (FSNamesystemState carries the live/dead counts)
+        "num_live_datanodes": _num(fss, "NumLiveDataNodes"),
+        "num_dead_datanodes": _num(fss, "NumDeadDataNodes"),
+        "num_stale_datanodes": _num(fsn, "NumStaleDataNodes"),
+        "num_decom_live_datanodes": _num(fss, "NumDecomLiveDataNodes"),
+        "num_decom_dead_datanodes": _num(fss, "NumDecomDeadDataNodes"),
+        "volume_failures_total": _num(fss, "VolumeFailuresTotal"),
+        # rpc
+        "rpc_queue_time_avg_ms": _num(rpc, "RpcQueueTimeAvgTime"),
+        "rpc_processing_time_avg_ms": _num(rpc, "RpcProcessingTimeAvgTime"),
+        "rpc_queue_time_num_ops": _num(rpc, "RpcQueueTimeNumOps"),
+        "rpc_processing_time_num_ops": _num(rpc, "RpcProcessingTimeNumOps"),
+        "call_queue_length": _num(rpc, "CallQueueLength"),
+        "num_open_connections": _num(rpc, "NumOpenConnections"),
+        # jvm
+        "jvm_heap_used_mb": heap_used,
+        "jvm_heap_max_mb": heap_max,
+        "jvm_heap_used_pct": (100.0 * heap_used / heap_max)
+                             if (heap_max and heap_used is not None) else None,
+        "jvm_gc_count": _num(jvm, "GcCount"),
+        "jvm_gc_time_ms": _num(jvm, "GcTimeMillis"),
+        "jvm_gc_num_warn_threshold_exceeded": _num(jvm, "GcNumWarnThresholdExceeded"),
+        "threads_blocked": _num(jvm, "ThreadsBlocked"),
+        "threads_waiting": _num(jvm, "ThreadsWaiting"),
+    }
+    # keep the full numeric FSNamesystem + RPC + JVM fields under jmx.* so
+    # nothing useful is lost and ad-hoc queries stay possible
+    doc["jmx"] = {}
+    for bean in (fsn, fss, rpc, jvm):
+        for k, v in (bean or {}).items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                doc["jmx"][k] = v
+    return doc
+
+
+def _str(bean, key):
+    if not bean:
+        return None
+    v = bean.get(key)
+    return v if isinstance(v, str) and v != "" else None
+
+
+# ==================================================
+# KUDU MASTER (METRICS) BUILDER
+# ==================================================
+
+# Server metrics promoted to friendly top-level fields when present. Times
+# from Kudu are microseconds for histograms and milliseconds for the cpu
+# counters; we keep the native unit and name fields accordingly.
+KUDU_PROMOTE = {
+    "rpcs_queue_overflow": "rpc_queue_overflow",
+    "rpc_connections_accepted": "rpc_connections_accepted",
+    "threads_running": "threads_running",
+    "threads_started": "threads_started",
+    "cpu_utime": "cpu_utime_ms",
+    "cpu_stime": "cpu_stime_ms",
+    "voluntary_context_switches": "voluntary_context_switches",
+    "involuntary_context_switches": "involuntary_context_switches",
+    "glog_error_messages": "glog_error_messages",
+    "glog_warning_messages": "glog_warning_messages",
+    "block_cache_hits_caching": "block_cache_hits_caching",
+    "block_cache_misses_caching": "block_cache_misses_caching",
+    "block_cache_usage": "block_cache_usage_bytes",
+    "data_dirs_failed": "data_dirs_failed",
+    "data_dirs_full": "data_dirs_full",
+}
+
+
+def build_kudu_doc(host, entities):
+    """Flatten the Kudu master 'server' entity metrics into one time-series
+    document. Counters/gauges contribute their value; histograms contribute
+    mean / p99 / max / count. A curated set is promoted to friendly fields;
+    everything numeric is also kept under metrics.* . Never raises."""
+    now = datetime.now(timezone.utc).isoformat()
+    server = None
+    for ent in entities or []:
+        if ent.get("type") == "server":
+            server = ent
+            break
+
+    doc = {"@timestamp": now, "host": host,
+           "entity_id": (server or {}).get("id"), "metrics": {}}
+
+    for metric in (server or {}).get("metrics", []) or []:
+        name = metric.get("name")
+        if not name:
+            continue
+        if "value" in metric:                       # counter or gauge
+            val = metric.get("value")
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                doc["metrics"][name] = val
+                if name in KUDU_PROMOTE:
+                    doc[KUDU_PROMOTE[name]] = val
+        elif "total_count" in metric:               # histogram
+            doc["metrics"][name + "_mean"] = metric.get("mean")
+            doc["metrics"][name + "_p99"] = metric.get("percentile_99")
+            doc["metrics"][name + "_max"] = metric.get("max")
+            doc["metrics"][name + "_count"] = metric.get("total_count")
+            if name == "rpc_incoming_queue_time":
+                doc["rpc_incoming_queue_time_mean_us"] = metric.get("mean")
+                doc["rpc_incoming_queue_time_p99_us"] = metric.get("percentile_99")
+                doc["rpc_incoming_queue_time_max_us"] = metric.get("max")
+                doc["rpc_incoming_queue_time_count"] = metric.get("total_count")
+
+    # derived: block cache hit ratio
+    hits = doc.get("block_cache_hits_caching")
+    misses = doc.get("block_cache_misses_caching")
+    if hits is not None and misses is not None and (hits + misses) > 0:
+        doc["block_cache_hit_ratio"] = round(hits / (hits + misses), 4)
+
+    # leadership: the master that has a positive raft leader-election term for
+    # the catalog / sys.catalog tablet is the active leader. Best-effort: many
+    # builds expose 'is_raft_leader' or a leader role gauge; fall back to None.
+    leader = doc["metrics"].get("is_raft_leader")
+    if leader is None:
+        leader = doc["metrics"].get("leader_count")  # 1 on the leader master
+    doc["is_leader"] = bool(leader) if leader is not None else None
+
+    return doc
+
+
+# ==================================================
 # COLLECTOR
 # ==================================================
 
@@ -1128,9 +1478,55 @@ class ImpalaCollector:
             for query_id, sql in todo:
                 pool.submit(self.process_query, server, query_id, sql)
 
-    def run_once(self):
+    # ---- cluster health (HDFS / Kudu) -------------------------------
+
+    def collect_hdfs(self, host):
+        beans = fetch_jmx(host)
+        if beans is None:
+            return
+        try:
+            doc = build_hdfs_doc(host, beans)
+        except Exception:
+            log.exception("HDFS jmx parse failed for %s", host)
+            return
+        # time-series id: one doc per node per poll
+        doc_id = "%s_%d" % (host, int(time.time() * 1000))
+        self.sink.index(INDEX_HDFS, doc, doc_id=doc_id)
+        log.info("HDFS %s -> indexed (%s, live_dn=%s, missing_blocks=%s)",
+                 host, doc.get("ha_state"), doc.get("num_live_datanodes"),
+                 doc.get("missing_blocks"))
+
+    def collect_kudu(self, host):
+        entities = fetch_kudu_metrics(host)
+        if entities is None:
+            return
+        try:
+            doc = build_kudu_doc(host, entities)
+        except Exception:
+            log.exception("Kudu metrics parse failed for %s", host)
+            return
+        doc_id = "%s_%d" % (host, int(time.time() * 1000))
+        self.sink.index(INDEX_KUDU, doc, doc_id=doc_id)
+        log.info("Kudu %s -> indexed (leader=%s, rpc_overflow=%s, errors=%s)",
+                 host, doc.get("is_leader"), doc.get("rpc_queue_overflow"),
+                 doc.get("glog_error_messages"))
+
+    def collect_cluster(self):
+        """Scrape all HDFS NameNodes and Kudu masters once."""
+        nodes = ([("hdfs", h) for h in HDFS_NAMENODES]
+                 + [("kudu", h) for h in KUDU_MASTERS])
+        if not nodes:
+            return
+        with ThreadPoolExecutor(max_workers=max(len(nodes), 1)) as pool:
+            for kind, host in nodes:
+                pool.submit(self.collect_hdfs if kind == "hdfs"
+                            else self.collect_kudu, host)
+
+    def run_once(self, with_cluster=False):
         with ThreadPoolExecutor(max_workers=len(IMPALA_SERVERS)) as executor:
             executor.map(self.process_server, IMPALA_SERVERS)
+        if with_cluster:
+            self.collect_cluster()
         cleanup_cache()
 
 
@@ -1145,12 +1541,20 @@ def cleanup_cache():
 # ==================================================
 
 def main():
-    log.info("Starting Qimpala monitor (servers=%d, interval=%ds)",
-             len(IMPALA_SERVERS), POLL_INTERVAL)
+    log.info("Starting Qimpala monitor (impala=%d, hdfs=%d, kudu=%d, "
+             "query interval=%ds, cluster interval=%ds)",
+             len(IMPALA_SERVERS), len(HDFS_NAMENODES), len(KUDU_MASTERS),
+             POLL_INTERVAL, CLUSTER_POLL_INTERVAL)
     sink = ElasticsearchSink()
     collector = ImpalaCollector(sink)
+    last_cluster = 0.0
     while True:
-        collector.run_once()
+        now = time.time()
+        # cluster health is polled on its own (slower) cadence
+        with_cluster = (now - last_cluster) >= CLUSTER_POLL_INTERVAL
+        if with_cluster:
+            last_cluster = now
+        collector.run_once(with_cluster=with_cluster)
         time.sleep(POLL_INTERVAL)
 
 
@@ -1254,4 +1658,62 @@ if __name__ == "__main__":
 #     {"cause": "KUDU_SCAN_BOTTLENECK", "severity": "high", "score": 0.391},
 #     {"cause": "DATA_SKEW", "severity": "medium", "score": 0.391}
 #   ]
+# }
+#
+# hdfs-namenode-metrics  (time series: one doc per NameNode per poll)
+# ----------------------
+# {
+#   "@timestamp": "2026-06-15T07:22:30.000Z",
+#   "host": "namenode01.company.local",
+#   "ha_state": "active",            <- active / standby (HA role)
+#   "fs_state": "Operational",
+#   "safemode": "OFF",
+#   "capacity_total_bytes": 109951162777600,
+#   "capacity_used_bytes": 76965813944320,
+#   "capacity_remaining_bytes": 32985348833280,
+#   "capacity_used_pct": 70.0,
+#   "blocks_total": 5123456,
+#   "files_total": 7891011,
+#   "missing_blocks": 2,
+#   "corrupt_blocks": 1,
+#   "under_replicated_blocks": 134,
+#   "num_live_datanodes": 8,
+#   "num_dead_datanodes": 1,
+#   "volume_failures_total": 3,
+#   "rpc_queue_time_avg_ms": 1.8,
+#   "rpc_processing_time_avg_ms": 3.2,
+#   "call_queue_length": 7,
+#   "num_open_connections": 210,
+#   "jvm_heap_used_mb": 24576.0,
+#   "jvm_heap_max_mb": 32768.0,
+#   "jvm_heap_used_pct": 75.0,
+#   "jvm_gc_count": 150234,
+#   "jvm_gc_time_ms": 845231,
+#   "jmx": { "...": "full numeric FSNamesystem/RPC/JVM fields kept verbatim" }
+# }
+#
+# kudu-master-metrics  (time series: one doc per master per poll)
+# -------------------
+# {
+#   "@timestamp": "2026-06-15T07:22:30.000Z",
+#   "host": "kudumaster01.company.local",
+#   "entity_id": "kudu.master",
+#   "is_leader": true,
+#   "rpc_queue_overflow": 0,
+#   "rpc_connections_accepted": 15234,
+#   "rpc_incoming_queue_time_mean_us": 42.7,
+#   "rpc_incoming_queue_time_p99_us": 350,
+#   "rpc_incoming_queue_time_max_us": 98000,
+#   "rpc_incoming_queue_time_count": 50000,
+#   "threads_running": 62,
+#   "cpu_utime_ms": 982340,
+#   "cpu_stime_ms": 341200,
+#   "voluntary_context_switches": 88231,
+#   "involuntary_context_switches": 12003,
+#   "glog_error_messages": 0,
+#   "glog_warning_messages": 37,
+#   "block_cache_hits_caching": 900000,
+#   "block_cache_misses_caching": 100000,
+#   "block_cache_hit_ratio": 0.9,
+#   "metrics": { "...": "every numeric server metric; histograms as _mean/_p99/_max/_count" }
 # }

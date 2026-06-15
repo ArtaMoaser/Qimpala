@@ -11,11 +11,13 @@ the collector writes.
 3. Choose *"Automatically overwrite conflicts"* if you are re-importing.
 4. Open **Dashboard → Impala Query Monitoring**.
 
-It creates three index patterns (`impala-query-summary`, `impala-query-metrics`,
-`impala-query-analysis`), 11 visualizations, and the dashboard linking them.
+It creates five index patterns (`impala-query-summary`, `impala-query-metrics`,
+`impala-query-analysis`, `hdfs-namenode-metrics`, `kudu-master-metrics`),
+23 visualizations, and the dashboard linking them.
 
 ## What's on it
 
+### Query monitoring
 | Panel | Source | Shows |
 |-------|--------|-------|
 | Total Queries | summary | exact distinct query count |
@@ -27,6 +29,32 @@ It creates three index patterns (`impala-query-summary`, `impala-query-metrics`,
 | Suspected Root Cause | analysis | rule-engine verdict distribution |
 | Severity Breakdown | analysis | ok / low / medium / high / critical |
 | Root Cause by Severity | analysis | cross-tab table |
+
+### HDFS NameNode health (time series)
+| Panel | Shows |
+|-------|-------|
+| HDFS NameNode Status | per-node HA role, capacity %, dead DN, missing blocks |
+| HDFS Capacity Used (%) | capacity trend per node |
+| HDFS DataNodes (live vs dead) | datanode liveness |
+| HDFS Block Health | missing / corrupt / under-replicated blocks |
+| HDFS Heap Used (%) | NameNode JVM heap pressure |
+| HDFS RPC Latency & Call Queue | RPC queue/processing time and call-queue length |
+
+### Kudu master health (time series)
+| Panel | Shows |
+|-------|-------|
+| Kudu Master Status | leader flag, p99 RPC queue time, errors, overflow |
+| Kudu Master RPC Incoming Queue Time | p99/mean queue wait (scan-pressure signal) |
+| Kudu Master RPC Queue Overflow | rejected/dropped RPCs |
+| Kudu Master Error & Warning Logs | glog error/warning counts |
+| Kudu Master Block Cache Hit Ratio | cache effectiveness |
+| Kudu Master Threads Running | thread pressure |
+
+The HDFS/Kudu indices are **time series** (one document per node per poll,
+`@timestamp` = scrape time), so their panels use `@timestamp` as the time
+field and trend cluster health alongside query activity. When an Impala query
+shows an `HDFS_SCAN_BOTTLENECK` or `KUDU_SCAN_BOTTLENECK`, line these panels up
+against the query's start time to see whether the cluster itself was degraded.
 
 ## Accurate counts
 

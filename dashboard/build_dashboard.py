@@ -26,6 +26,8 @@ KIBANA_VERSION = "7.17.0"
 IDX_SUMMARY = "impala-query-summary"
 IDX_METRICS = "impala-query-metrics"
 IDX_ANALYSIS = "impala-query-analysis"
+IDX_HDFS = "hdfs-namenode-metrics"
+IDX_KUDU = "kudu-master-metrics"
 
 objects = []
 
@@ -51,6 +53,8 @@ def index_pattern(pattern_id, title, time_field):
 index_pattern(IDX_SUMMARY, IDX_SUMMARY, "start_time")
 index_pattern(IDX_METRICS, IDX_METRICS, "start_time")
 index_pattern(IDX_ANALYSIS, IDX_ANALYSIS, "start_time")
+index_pattern(IDX_HDFS, IDX_HDFS, "@timestamp")
+index_pattern(IDX_KUDU, IDX_KUDU, "@timestamp")
 
 
 # ----------------------------------------------------------------------
@@ -110,6 +114,42 @@ def agg_date_histogram(agg_id, field="start_time", schema="segment"):
             "params": {"field": field, "useNormalizedEsInterval": True,
                        "interval": "auto", "drop_partials": False,
                        "min_doc_count": 1, "extended_bounds": {}}}
+
+
+def timeseries_line(viz_id, title, index_pattern_id, metrics, y_title,
+                    split_by="host", time_field="@timestamp", chart="line"):
+    """A line/area chart of one or more metrics over @timestamp, optionally
+    split into one series per host. ``metrics`` is a list of (kind, field)."""
+    aggs, series = [], []
+    for i, (kind, field) in enumerate(metrics, start=1):
+        aggs.append(agg_metric(str(i), kind, field))
+        series.append({"show": True, "type": chart, "mode": "normal",
+                       "data": {"label": "%s %s" % (kind, field), "id": str(i)},
+                       "valueAxis": "ValueAxis-1", "drawLinesBetweenPoints": True,
+                       "showCircles": False})
+    aggs.append(agg_date_histogram(str(len(metrics) + 1), field=time_field))
+    if split_by:
+        aggs.append(agg_terms(str(len(metrics) + 2), split_by, size=10,
+                              order_by="1", schema="group"))
+    visualization(viz_id, title, index_pattern_id, {
+        "title": title, "type": chart,
+        "aggs": aggs,
+        "params": {"type": chart, "grid": {"categoryLines": False},
+                   "categoryAxes": [{"id": "CategoryAxis-1", "type": "category",
+                                     "position": "bottom", "show": True,
+                                     "scale": {"type": "linear"},
+                                     "labels": {"show": True, "truncate": 100},
+                                     "title": {}}],
+                   "valueAxes": [{"id": "ValueAxis-1", "name": "LeftAxis-1",
+                                  "type": "value", "position": "left",
+                                  "show": True,
+                                  "scale": {"type": "linear", "mode": "normal"},
+                                  "labels": {"show": True, "rotate": 0,
+                                             "filter": False, "truncate": 100},
+                                  "title": {"text": y_title}}],
+                   "seriesParams": series, "addTooltip": True, "addLegend": True,
+                   "legendPosition": "right", "times": [], "addTimeMarker": False}},
+    )
 
 
 # ----------------------------------------------------------------------
@@ -285,11 +325,107 @@ visualization("qimpala-findings-table", "Root Cause by Severity",
 })
 
 
+# ---- HDFS NameNode health (time series) ------------------------------
+
+# 12. capacity used %
+timeseries_line("qimpala-hdfs-capacity", "HDFS Capacity Used (%)", IDX_HDFS,
+                [("max", "capacity_used_pct")], "Capacity used (%)")
+
+# 13. block health (missing / corrupt / under-replicated) - max per bucket
+timeseries_line("qimpala-hdfs-block-health",
+                "HDFS Block Health (missing / corrupt / under-replicated)",
+                IDX_HDFS,
+                [("max", "missing_blocks"), ("max", "corrupt_blocks"),
+                 ("max", "under_replicated_blocks")],
+                "Block count", split_by=None)
+
+# 14. datanode liveness
+timeseries_line("qimpala-hdfs-datanodes",
+                "HDFS DataNodes (live vs dead)", IDX_HDFS,
+                [("max", "num_live_datanodes"), ("max", "num_dead_datanodes")],
+                "DataNodes", split_by=None)
+
+# 15. NameNode RPC latency
+timeseries_line("qimpala-hdfs-rpc",
+                "HDFS NameNode RPC Latency (ms) & Call Queue", IDX_HDFS,
+                [("max", "rpc_queue_time_avg_ms"),
+                 ("max", "rpc_processing_time_avg_ms"),
+                 ("max", "call_queue_length")],
+                "ms / queue length")
+
+# 16. NameNode JVM heap & GC
+timeseries_line("qimpala-hdfs-jvm",
+                "HDFS NameNode Heap Used (%)", IDX_HDFS,
+                [("max", "jvm_heap_used_pct")], "Heap used (%)")
+
+# 17. current HA roles / status table
+visualization("qimpala-hdfs-status", "HDFS NameNode Status", IDX_HDFS, {
+    "title": "HDFS NameNode Status", "type": "table",
+    "aggs": [
+        agg_metric("1", "max", "capacity_used_pct"),
+        agg_metric("4", "max", "num_dead_datanodes"),
+        agg_metric("5", "max", "missing_blocks"),
+        agg_terms("2", "host", size=10, order_by="1"),
+        agg_terms("3", "ha_state", size=3, order_by="1", schema="bucket"),
+    ],
+    "params": {"perPage": 10, "showPartialRows": False,
+               "showMetricsAtAllLevels": False, "showTotal": False,
+               "totalFunc": "sum", "percentageCol": ""},
+})
+
+
+# ---- Kudu master health (time series) --------------------------------
+
+# 18. RPC incoming queue time (p99 / mean) - scan/admission pressure signal
+timeseries_line("qimpala-kudu-rpc-queue",
+                "Kudu Master RPC Incoming Queue Time (us)", IDX_KUDU,
+                [("max", "rpc_incoming_queue_time_p99_us"),
+                 ("avg", "rpc_incoming_queue_time_mean_us")],
+                "microseconds")
+
+# 19. RPC queue overflow (dropped/rejected RPCs)
+timeseries_line("qimpala-kudu-overflow",
+                "Kudu Master RPC Queue Overflow", IDX_KUDU,
+                [("max", "rpc_queue_overflow")], "overflow count")
+
+# 20. error / warning log messages
+timeseries_line("qimpala-kudu-logs",
+                "Kudu Master Error & Warning Log Messages", IDX_KUDU,
+                [("max", "glog_error_messages"),
+                 ("max", "glog_warning_messages")], "message count")
+
+# 21. block cache hit ratio
+timeseries_line("qimpala-kudu-cache",
+                "Kudu Master Block Cache Hit Ratio", IDX_KUDU,
+                [("avg", "block_cache_hit_ratio")], "hit ratio")
+
+# 22. threads running
+timeseries_line("qimpala-kudu-threads",
+                "Kudu Master Threads Running", IDX_KUDU,
+                [("max", "threads_running")], "threads")
+
+# 23. current master status table (leader, errors, queue)
+visualization("qimpala-kudu-status", "Kudu Master Status", IDX_KUDU, {
+    "title": "Kudu Master Status", "type": "table",
+    "aggs": [
+        agg_metric("1", "max", "rpc_incoming_queue_time_p99_us"),
+        agg_metric("4", "max", "glog_error_messages"),
+        agg_metric("5", "max", "rpc_queue_overflow"),
+        agg_terms("2", "host", size=10, order_by="1"),
+        agg_terms("3", "is_leader", size=2, order_by="1", schema="bucket"),
+    ],
+    "params": {"perPage": 10, "showPartialRows": False,
+               "showMetricsAtAllLevels": False, "showTotal": False,
+               "totalFunc": "sum", "percentageCol": ""},
+})
+
+
 # ----------------------------------------------------------------------
 # dashboard
 # ----------------------------------------------------------------------
 # Kibana 7 grid is 48 columns wide. (x, y, w, h) per panel.
 LAYOUT = [
+    # --- query overview ---
     ("qimpala-total-queries",      0,  0, 12,  8),
     ("qimpala-root-cause",        12,  0, 18,  8),
     ("qimpala-severity",          30,  0, 18,  8),
@@ -301,6 +437,20 @@ LAYOUT = [
     ("qimpala-slowest-queries",   24, 28, 24, 12),
     ("qimpala-by-type",            0, 40, 16, 10),
     ("qimpala-findings-table",    16, 40, 32, 10),
+    # --- HDFS NameNode health ---
+    ("qimpala-hdfs-status",        0, 50, 24, 10),
+    ("qimpala-hdfs-capacity",     24, 50, 24, 10),
+    ("qimpala-hdfs-datanodes",     0, 60, 16, 10),
+    ("qimpala-hdfs-block-health", 16, 60, 16, 10),
+    ("qimpala-hdfs-jvm",          32, 60, 16, 10),
+    ("qimpala-hdfs-rpc",           0, 70, 48, 10),
+    # --- Kudu master health ---
+    ("qimpala-kudu-status",        0, 80, 24, 10),
+    ("qimpala-kudu-rpc-queue",    24, 80, 24, 10),
+    ("qimpala-kudu-overflow",      0, 90, 16, 10),
+    ("qimpala-kudu-logs",         16, 90, 16, 10),
+    ("qimpala-kudu-cache",        32, 90, 16, 10),
+    ("qimpala-kudu-threads",       0,100, 24, 10),
 ]
 
 panels, references = [], []
